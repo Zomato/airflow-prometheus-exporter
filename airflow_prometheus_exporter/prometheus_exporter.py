@@ -2,11 +2,13 @@
 import json
 import pickle
 from contextlib import contextmanager
+from datetime import timedelta
 
 from airflow.configuration import conf
 from airflow.models import DagModel, DagRun, TaskInstance, TaskFail, XCom
 from airflow.plugins_manager import AirflowPlugin
 from airflow.settings import RBAC, Session
+from airflow.utils import timezone
 from airflow.utils.state import State
 from airflow.utils.log.logging_mixin import LoggingMixin
 from flask import Response
@@ -17,7 +19,7 @@ from sqlalchemy import and_, func
 
 from airflow_prometheus_exporter.xcom_config import load_xcom_config
 
-CANARY_DAG = "canary_dag"
+AIRFLOW_LOG_CLEANUP = "airflow-log-cleanup"
 
 
 @contextmanager
@@ -76,6 +78,7 @@ def get_dag_duration_info():
                 DagModel.is_paused == False,
                 DagRun.state == State.SUCCESS,
                 DagRun.end_date.isnot(None),
+                DagRun.end_date >= (timezone.utcnow() - timedelta(minutes=5))
             )
             .group_by(DagRun.dag_id)
             .subquery()
@@ -98,6 +101,10 @@ def get_dag_duration_info():
                         == max_execution_dt_query.c.max_execution_dt
                     ),
                 ),
+            )
+            .filter(
+                TaskInstance.start_date.isnot(None),
+                TaskInstance.end_date.isnot(None),
             )
             .group_by(
                 max_execution_dt_query.c.dag_id,
@@ -245,6 +252,7 @@ def get_task_duration_info():
                 DagModel.is_paused == False,
                 DagRun.state == State.SUCCESS,
                 DagRun.end_date.isnot(None),
+                DagRun.end_date >= (timezone.utcnow() - timedelta(minutes=5))
             )
             .group_by(DagRun.dag_id)
             .subquery()
@@ -289,7 +297,7 @@ def get_dag_scheduler_delay():
             session.query(
                 DagRun.dag_id, DagRun.execution_date, DagRun.start_date,
             )
-            .filter(DagRun.dag_id == CANARY_DAG,)
+            .filter(DagRun.dag_id == AIRFLOW_LOG_CLEANUP, )
             .order_by(DagRun.execution_date.desc())
             .limit(1)
             .all()
@@ -305,7 +313,7 @@ def get_task_scheduler_delay():
                 func.max(TaskInstance.start_date).label("max_start"),
             )
             .filter(
-                TaskInstance.dag_id == CANARY_DAG,
+                TaskInstance.dag_id == AIRFLOW_LOG_CLEANUP,
                 TaskInstance.queued_dttm.isnot(None),
             )
             .group_by(TaskInstance.queue)
@@ -327,7 +335,7 @@ def get_task_scheduler_delay():
             )
             .filter(
                 TaskInstance.dag_id
-                == CANARY_DAG,  # Redundant, for performance.
+                == AIRFLOW_LOG_CLEANUP,  # Redundant, for performance.
             )
             .all()
         )
@@ -478,7 +486,6 @@ REGISTRY.register(MetricsCollector())
 
 if RBAC:
     from flask_appbuilder import BaseView as FABBaseView, expose as FABexpose
-
 
     class RBACMetrics(FABBaseView):
         route_base = "/admin/metrics/"
