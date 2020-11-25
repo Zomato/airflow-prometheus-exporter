@@ -293,13 +293,29 @@ def get_task_duration_info():
 def get_dag_scheduler_delay():
     """Compute DAG scheduling delay."""
     with session_scope(Session) as session:
+        max_execution_dt_query = (
+            session.query(
+                DagRun.dag_id,
+                func.max(DagRun.execution_date).label("max_execution_dt"),
+            )
+            .join(DagModel, DagModel.dag_id == DagRun.dag_id)
+            .filter(
+                DagModel.is_active == True,  # noqa
+                DagModel.is_paused == False
+            )
+            .group_by(DagRun.dag_id)
+            .subquery()
+        )
         return (
             session.query(
                 DagRun.dag_id, DagRun.execution_date, DagRun.start_date,
             )
-            .filter(DagRun.dag_id == AIRFLOW_LOG_CLEANUP, )
-            .order_by(DagRun.execution_date.desc())
-            .limit(1)
+            .join(max_execution_dt_query,
+                  and_(
+                      DagRun.dag_id == max_execution_dt_query.c.dag_id,
+                      DagRun.execution_date == max_execution_dt_query.c.max_execution_dt
+                  )
+            )
             .all()
         )
 
@@ -307,35 +323,38 @@ def get_dag_scheduler_delay():
 def get_task_scheduler_delay():
     """Compute Task scheduling delay."""
     with session_scope(Session) as session:
-        task_status_query = (
+        max_execution_dt_query = (
             session.query(
-                TaskInstance.queue,
-                func.max(TaskInstance.start_date).label("max_start"),
+                DagRun.dag_id,
+                func.max(DagRun.execution_date).label("max_execution_dt"),
             )
-            .filter(
-                TaskInstance.dag_id == AIRFLOW_LOG_CLEANUP,
-                TaskInstance.queued_dttm.isnot(None),
+                .join(DagModel, DagModel.dag_id == DagRun.dag_id)
+                .filter(
+                DagModel.is_active == True,  # noqa
+                DagModel.is_paused == False
             )
-            .group_by(TaskInstance.queue)
-            .subquery()
+                .group_by(DagRun.dag_id)
+                .subquery()
         )
+
         return (
             session.query(
-                task_status_query.c.queue,
+                TaskInstance.dag_id,
+                TaskInstance.task_id,
                 TaskInstance.execution_date,
                 TaskInstance.queued_dttm,
-                task_status_query.c.max_start.label("start_date"),
+                TaskInstance.start_date,
             )
             .join(
-                TaskInstance,
+                max_execution_dt_query,
                 and_(
-                    TaskInstance.queue == task_status_query.c.queue,
-                    TaskInstance.start_date == task_status_query.c.max_start,
+                    TaskInstance.dag_id == max_execution_dt_query.c.dag_id,
+                    TaskInstance.execution_date == max_execution_dt_query.c.max_execution_dt,
                 ),
             )
             .filter(
-                TaskInstance.dag_id
-                == AIRFLOW_LOG_CLEANUP,  # Redundant, for performance.
+                TaskInstance.queued_dttm.isnot(None),
+                TaskInstance.start_date.isnot(None)
             )
             .all()
         )
@@ -461,7 +480,7 @@ class MetricsCollector(object):
         task_scheduler_delay = GaugeMetricFamily(
             "airflow_task_scheduler_delay",
             "Airflow Task scheduling delay",
-            labels=["queue"],
+            labels=["dag_id", "task_id"],
         )
 
         for task in get_task_scheduler_delay():
@@ -469,7 +488,7 @@ class MetricsCollector(object):
                 task.start_date - task.queued_dttm
             ).total_seconds()
             task_scheduler_delay.add_metric(
-                [task.queue], task_scheduling_delay_value
+                [task.dag_id, task.task_id], task_scheduling_delay_value
             )
         yield task_scheduler_delay
 
